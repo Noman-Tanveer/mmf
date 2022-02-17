@@ -10,12 +10,13 @@ from mmf.utils.build import build_optimizer
 from omegaconf import OmegaConf
 from tests.test_utils import SimpleModel, skip_if_no_cuda
 from tests.trainers.test_training_loop import TrainerTrainingLoopMock
+from tests.trainers.test_utils import get_config_with_defaults
 
 
 try:
-    from fairscale.optim.oss import OSS
     from fairscale.nn.data_parallel import ShardedDataParallel
     from fairscale.optim.grad_scaler import ShardedGradScaler
+    from fairscale.optim.oss import OSS
 
     FAIRSCALE_AVAILABLE = True
 except ImportError:
@@ -23,16 +24,13 @@ except ImportError:
 
 
 class MMFTrainerMock(TrainerTrainingLoopMock, MMFTrainer):
-    def __init__(
-        self,
-        config,
-        num_train_data,
-        max_updates,
-        max_epochs,
-        device="cuda",
-        fp16_model=False,
-    ):
-        super().__init__(num_train_data, max_updates, max_epochs, fp16=True)
+    def __init__(self, config, num_train_data, max_updates, max_epochs, device="cuda"):
+        config.training.max_updates = max_updates
+        config.training.max_epochs = max_epochs
+        config.training.fp16 = True
+        config = get_config_with_defaults(config)
+
+        super().__init__(num_train_data, config=config)
         self.device = torch.device(device)
         self.config = config
         self.model = SimpleModel({"in_dim": 1})
@@ -59,7 +57,7 @@ class TestShardedDDP(unittest.TestCase):
                     "enable_state_sharding": True,
                     "params": {"lr": 5e-5},
                 },
-                "training": {"find_unused_parameters": False},
+                "training": {"batch_size": 1, "find_unused_parameters": False},
             }
         )
         self.config_no_oss = OmegaConf.create(
@@ -69,7 +67,7 @@ class TestShardedDDP(unittest.TestCase):
                     "enable_state_sharding": False,
                     "params": {"lr": 5e-5},
                 },
-                "training": {"find_unused_parameters": False},
+                "training": {"batch_size": 1, "find_unused_parameters": False},
             }
         )
         self.trainer = None

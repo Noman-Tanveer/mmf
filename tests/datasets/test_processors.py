@@ -4,11 +4,13 @@ import tempfile
 import unittest
 
 import torch
+from mmf.datasets.processors.image_processors import VILTImageProcessor
 from mmf.datasets.processors.processors import (
     CaptionProcessor,
     EvalAIAnswerProcessor,
     MultiClassFromFile,
     MultiHotAnswerFromVocabProcessor,
+    Processor,
     TransformerBboxProcessor,
 )
 from mmf.utils.configuration import load_yaml
@@ -173,3 +175,25 @@ class TestDatasetProcessors(unittest.TestCase):
 
         self.assertRaises(AssertionError, processor, {"label": "UNK"})
         os.unlink(f.name)
+
+    def test_vilt_image_processor(self):
+        from torchvision.transforms import ToPILImage
+
+        size = 384
+        config = OmegaConf.create({"size": [size, size]})
+        image_processor = VILTImageProcessor(config)
+
+        expected_size = torch.Size([3, size, size])
+
+        image = ToPILImage()(torch.ones(3, 300, 500))
+        processed_image = image_processor(image)
+        self.assertEqual(processed_image.size(), expected_size)
+
+        image = ToPILImage()(torch.ones(1, 224, 224))
+        processed_image = image_processor(image)
+        self.assertEqual(processed_image.size(), expected_size)
+
+    def test_processor_class_None(self):
+        config = OmegaConf.create({"type": "UndefinedType"})
+        with self.assertRaises(ValueError):
+            Processor(config)

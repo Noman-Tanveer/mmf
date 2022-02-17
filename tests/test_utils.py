@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 import torch
+from mmf.common.registry import registry
 from mmf.common.sample import Sample, SampleList
 from mmf.models.base_model import BaseModel
 from mmf.utils.general import get_current_device
@@ -25,9 +26,16 @@ def compare_tensors(a, b):
     return torch.equal(a, b)
 
 
-def dummy_args(model="cnn_lstm", dataset="clevr"):
+def dummy_args(model="cnn_lstm", dataset="clevr", config=None):
+    if config is None:
+        config = os.path.join("configs", "defaults.yaml")
     args = argparse.Namespace()
-    args.opts = [f"model={model}", f"dataset={dataset}"]
+    args.opts = [
+        f"model={model}",
+        f"dataset={dataset}",
+        f"datasets={dataset}",
+        f"config={config}",
+    ]
     args.config_override = None
     return args
 
@@ -80,6 +88,25 @@ def skip_if_macos(testfn, reason="Doesn't run on MacOS"):
 
 def skip_if_non_fb(testfn, reason="Doesn't run on non FB infra"):
     return unittest.skipUnless(is_fb(), reason)(testfn)
+
+
+def skip_if_old_transformers(min_version="4.5.0"):
+    def wrap(testfn, reason="Requires newer version of transformers"):
+        from packaging import version
+        from transformers import __version__ as transformers_version
+
+        return unittest.skipUnless(
+            version.parse(transformers_version) >= version.parse(min_version), reason
+        )(testfn)
+
+    return wrap
+
+
+def skip_if_no_pytorchvideo(testfn, reason="Requires pytorchvideo"):
+    import importlib
+
+    pytorchvideo_spec = importlib.util.find_spec("pytorchvideo")
+    return unittest.skipIf(pytorchvideo_spec is None, reason)(testfn)
 
 
 def compare_state_dicts(a, b):
@@ -160,6 +187,7 @@ class NumbersDataset(torch.utils.data.Dataset):
         return self.num_examples
 
 
+@registry.register_model("simple_model")
 class SimpleModel(BaseModel):
     @dataclass
     class Config(BaseModel.Config):
@@ -180,43 +208,42 @@ class SimpleModel(BaseModel):
         batch = prepared_batch[self.data_item_key]
         output = self.classifier(batch)
         loss = torch.nn.MSELoss()(-1 * output, batch)
+
         return {
             "losses": {"loss": loss},
             "logits": output,
+            "scores": output,
             "input_batch": input_sample,
-            "dataset_type": "dummy_dataset_type",
-            "dataset_name": "dummy_dataset_name",
+            "dataset_type": input_sample["dataset_type"],
+            "dataset_name": input_sample["dataset_name"],
         }
 
 
+class SimpleNaNLossModel(SimpleModel):
+    def forward(self, prepared_batch: Dict[str, Tensor]):
+        report = super().forward(prepared_batch)
+        report["losses"]["loss"] /= 0.0  # create an NaN loss
+        return report
+
+
+@registry.register_model("simple_lightning_model")
 class SimpleLightningModel(SimpleModel):
-    def __init__(self, config: SimpleModel.Config, trainer_config=None):
+    def __init__(self, config: SimpleModel.Config):
         super().__init__(config)
-        self.trainer_config = trainer_config
 
     def build_meters(self, run_type):
         from mmf.utils.build import build_meters
 
         self.train_meter, self.val_meter, self.test_meter = build_meters(run_type)
 
-    def training_step(self, batch, batch_idx, *args, **kwargs):
-        return self._forward_step(batch, batch_idx, *args, **kwargs)
-
-    def validation_step(self, batch, batch_idx, *args, **kwargs):
-        return self._forward_step(batch, batch_idx, *args, **kwargs)
-
-    def _forward_step(self, batch, batch_idx, *args, **kwargs):
-        output = self(batch)
-        output["loss"] = output["losses"]["loss"]
-        return output
-
     def configure_optimizers(self):
-        if self.config is None:
+        config = registry.get("config")
+        if config is None:
             return torch.optim.Adam(self.parameters(), lr=0.01)
         else:
             from mmf.utils.build import build_lightning_optimizers
 
-            return build_lightning_optimizers(self, self.trainer_config)
+            return build_lightning_optimizers(self, config)
 
 
 def assertModulesEqual(mod1, mod2):

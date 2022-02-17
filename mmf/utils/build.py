@@ -18,9 +18,10 @@ from mmf.datasets.iteration_strategies import (
 )
 from mmf.datasets.processors.processors import Processor
 from mmf.utils.configuration import Configuration, get_global_config
-from mmf.utils.distributed import is_dist_initialized, is_master, is_xla, synchronize
+from mmf.utils.distributed import is_dist_initialized, is_main, is_xla, synchronize
 from mmf.utils.general import get_optimizer_parameters
 from omegaconf import DictConfig, OmegaConf
+from packaging import version
 
 
 try:
@@ -70,8 +71,50 @@ def build_trainer(config: DictConfig) -> Any:
     return trainer_obj
 
 
+def build_lightning_model(
+    config: Union[DictConfig, "mmf.models.base_model.BaseModel.Config"],
+    checkpoint_path: str = None,
+) -> "mmf.models.base_model.BaseModel":
+    from mmf.models.base_model import BaseModel
+
+    if not checkpoint_path:
+        model = build_model(config)
+        model.is_pl_enabled = True
+        return model
+
+    # If it is not an OmegaConf object, create the object
+    if not isinstance(config, DictConfig) and isinstance(config, BaseModel.Config):
+        config = OmegaConf.structured(config)
+
+    model_name = config.model
+    model_class = registry.get_model_class(model_name)
+
+    if model_class is None:
+        raise RuntimeError(f"No model registered for name: {model_name}")
+
+    """ model.build is called inside on_load_checkpoint as suggested here:
+    https://github.com/PyTorchLightning/pytorch-lightning/issues/5410
+    """
+
+    if is_main():
+        model_class.load_requirements(model_class, config=config)
+        model = model_class.load_from_checkpoint(
+            checkpoint_path, config=config, strict=False
+        )
+        synchronize()
+    else:
+        synchronize()
+        model = model_class.load_from_checkpoint(
+            checkpoint_path, config=config, strict=False
+        )
+
+    model.init_losses()
+    model.is_pl_enabled = True
+    return model
+
+
 def build_model(
-    config: Union[DictConfig, "mmf.models.base_model.BaseModel.Config"]
+    config: Union[DictConfig, "mmf.models.base_model.BaseModel.Config"],
 ) -> "mmf.models.base_model.BaseModel":
     from mmf.models.base_model import BaseModel
 
@@ -87,7 +130,7 @@ def build_model(
     model = model_class(config)
 
     if hasattr(model, "build"):
-        """ Model build involves checkpoint loading
+        """Model build involves checkpoint loading
         If the checkpoint is not available the underlying
         methods try to download it.
         Let master build the model (download the checkpoints) while
@@ -97,15 +140,14 @@ def build_model(
         now other cores can proceed to build the model
         using already downloaded checkpoint.
         """
-        if is_master():
-            model.load_requirements()
+        if is_main():
+            model_class.load_requirements(model_class, config=config)
             model.build()
             synchronize()
         else:
             synchronize()
             model.build()
         model.init_losses()
-
     return model
 
 
@@ -208,7 +250,7 @@ def build_multiple_datamodules(
             )
             dataset_config = OmegaConf.create()
 
-        if is_master():
+        if is_main():
             datamodule_instance.prepare_data(dataset_config)
 
         synchronize()
@@ -248,6 +290,21 @@ def build_dataloader_and_sampler(
         "shuffle": datamodule_config.get("shuffle", None),
         "batch_size": datamodule_config.get("batch_size", None),
     }
+    if version.parse(torch.__version__) >= version.parse("1.8"):
+        # only use persistent workers in PyTorch 1.8 or higher
+        # (PyTorch 1.7 also has this option but doesn't support it correctly due to
+        # https://github.com/pytorch/pytorch/issues/48370)
+        other_args["persistent_workers"] = (
+            datamodule_config.get(
+                "persistent_workers", training_config.get("persistent_workers", True)
+            ),
+        )
+        if other_args["persistent_workers"] and other_args["num_workers"] == 0:
+            logger.warning(
+                "persistent_workers cannot be used together with num_workers == 0; "
+                "setting persistent_workers to False"
+            )
+            other_args["persistent_workers"] = False
 
     # IterableDataset returns batches directly, so no need to add Sampler
     # or batch size as user is expected to control those. This is a fine
@@ -259,6 +316,8 @@ def build_dataloader_and_sampler(
     else:
         other_args.pop("shuffle")
 
+    # Set drop_last=True when using XLA to have constant batch size.
+    # In this case we also need to set drop_last=True in DistributedSampler.
     loader = torch.utils.data.DataLoader(
         dataset=dataset_instance,
         collate_fn=BatchCollator(
@@ -333,6 +392,7 @@ def _add_extra_args_for_dataloader(
             num_replicas=xm.xrt_world_size(),
             rank=xm.get_ordinal(),
             shuffle=other_args["shuffle"],
+            drop_last=True,
         )
         other_args.pop("shuffle")
 
@@ -344,18 +404,18 @@ def _add_extra_args_for_dataloader(
 
 def build_optimizer(model, config):
     optimizer_config = config.optimizer
-    if not hasattr(optimizer_config, "type"):
+    if "type" not in optimizer_config:
         raise ValueError(
             "Optimizer attributes must have a 'type' key "
             "specifying the type of optimizer. "
-            "(Custom or PyTorch)"
+            "(Custom or PyTorch, e.g. 'adam_w' or 'SGD')"
         )
     optimizer_type = optimizer_config.type
 
-    if not hasattr(optimizer_config, "params"):
+    if "params" not in optimizer_config:
         warnings.warn("optimizer attributes has no params defined, defaulting to {}.")
 
-    params = getattr(optimizer_config, "params", {})
+    params = optimizer_config.get("params", {})
 
     if hasattr(torch.optim, optimizer_type):
         optimizer_class = getattr(torch.optim, optimizer_type)
@@ -383,7 +443,11 @@ def build_optimizer(model, config):
         assert (
             is_dist_initialized()
         ), "Optimizer state sharding can only be used in distributed mode."
-        optimizer = OSS(params=parameters, optim=optimizer_class, **params)
+
+        is_fp16 = config.get("training", {}).get("fp16", False)
+        optimizer = OSS(
+            params=parameters, optim=optimizer_class, broadcast_fp16=is_fp16, **params
+        )
     else:
         optimizer = optimizer_class(parameters, **params)
     return optimizer
@@ -405,16 +469,16 @@ def build_lightning_optimizers(model, config):
 def build_scheduler(optimizer, config):
     scheduler_config = config.get("scheduler", {})
 
-    if not hasattr(scheduler_config, "type"):
+    if "type" not in scheduler_config:
         warnings.warn(
             "No type for scheduler specified even though lr_scheduler is True, "
             "setting default to 'Pythia'"
         )
-    scheduler_type = getattr(scheduler_config, "type", "pythia")
+    scheduler_type = scheduler_config.get("type", "pythia")
 
-    if not hasattr(scheduler_config, "params"):
+    if "params" not in scheduler_config:
         warnings.warn("scheduler attributes has no params defined, defaulting to {}.")
-    params = getattr(scheduler_config, "params", {})
+    params = scheduler_config.get("params", {})
     scheduler_class = registry.get_scheduler_class(scheduler_type)
     scheduler = scheduler_class(optimizer, **params)
 
@@ -538,17 +602,9 @@ def build_iteration_strategy(
         # This assumes all dataloaders will have same dataset type
         iteration_strategy_class = registry.get_iteration_strategy_class(config.type)
         config = config.get("params", {})
-        dataset_type = dataloaders[list(dataloaders.keys())[0]].dataset.dataset_type
-        if dataset_type != "train":
-            logger.info(
-                f"{iteration_strategy_class.__name__} updated to size "
-                + f"proportional for {dataset_type}"
-            )
-            return SizeProportionalIterationStrategy.from_params(
-                dataloaders, *args, **kwargs
-            )
-        else:
-            return iteration_strategy_class(config, dataloaders, *args, **kwargs)
+        # val and test splits won't be affected as test reporter iterates
+        # over the datasets one by one without using any iteration strategy
+        return iteration_strategy_class(config, dataloaders, *args, **kwargs)
 
 
 def build_meters(run_type: str) -> List[Meter]:

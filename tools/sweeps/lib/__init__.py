@@ -7,7 +7,8 @@ import os
 import socket
 
 
-def get_args():
+# if argv is None, we will read from sys.argv (invoke params)
+def get_args(argv=None):
     parser = argparse.ArgumentParser("Script for launching hyperparameter sweeps")
     parser.add_argument(
         "-p",
@@ -33,6 +34,15 @@ def get_args():
         help="number of nodes for distributed training",
     )
     parser.add_argument(
+        "--model_type",
+        type=str,
+        default="aicommerce__multimodal_model",
+        help="registered model type",
+    )
+    parser.add_argument(
+        "--oncall", type=str, default="ai_commerce", help="oncall team "
+    )
+    parser.add_argument(
         "--capabilities",
         type=str,
         default="GPU_V100_HOST",
@@ -41,6 +51,12 @@ def get_args():
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--config", type=str, default=None, help="configuration for model"
+    )
+    parser.add_argument(
+        "--extra_args",
+        type=str,
+        nargs="*",
+        help="extra arguments to be passed into MMF command (e.g. config arguments)",
     )
     parser.add_argument(
         "--baseline_model", help="path to baseline model from which to resume training"
@@ -168,7 +184,8 @@ def get_args():
         help="enable tensorboard logging by passing --tensorboard 1",
     )
 
-    args = parser.parse_args()
+    # Will read sys.argv if argv is None
+    args = parser.parse_args(argv)
     return args
 
 

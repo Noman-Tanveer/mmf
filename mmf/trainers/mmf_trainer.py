@@ -20,6 +20,7 @@ from mmf.trainers.core.training_loop import TrainerTrainingLoopMixin
 from mmf.utils.build import build_model, build_optimizer
 from mmf.utils.general import print_model_parameters
 from omegaconf import DictConfig, OmegaConf
+from packaging import version
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,12 @@ class MMFTrainer(
         # (otherwise the saved last_epoch in scheduler would be wrong)
         self.callbacks.append(self.checkpoint_callback)
         self.callbacks.append(self.logistics_callback)
+        # Add all customized callbacks defined by users
+        for callback in self.config.training.get("callbacks", []):
+            callback_type = callback.type
+            callback_param = callback.params
+            callback_cls = registry.get_callback_class(callback_type)
+            self.callbacks.append(callback_cls(self.config, self, **callback_param))
 
     def load_datasets(self):
         logger.info("Loading datasets")
@@ -107,16 +114,16 @@ class MMFTrainer(
 
     def load_fp16_scaler(self):
         if self.training_config.fp16:
-            assert (
-                torch.__version__ >= "1.6"
-            ), "Using fp16 requires torch version >- 1.6"
+            assert version.parse(torch.__version__) >= version.parse(
+                "1.6"
+            ), f"Using fp16 requires torch version >- 1.6, found: {torch.__version__}"
             assert self.device != torch.device("cpu"), "fp16 cannot be used on cpu"
 
         set_torch_grad_scaler = True
         if self.training_config.fp16 and self.distributed:
             try:
-                from fairscale.optim.oss import OSS
                 from fairscale.optim.grad_scaler import ShardedGradScaler
+                from fairscale.optim.oss import OSS
 
                 if isinstance(self.optimizer, OSS):
                     self.scaler = ShardedGradScaler()
@@ -133,16 +140,13 @@ class MMFTrainer(
         logger.info(self.model)
         print_model_parameters(self.model)
 
-        if "train" not in self.run_type:
-            self.inference()
-            return
-
-        self.on_train_start()
-        self.training_loop()
-        self.on_train_end()
+        if "train" in self.run_type:
+            self.on_train_start()
+            self.training_loop()
+            self.on_train_end()
 
         self.inference()
-        self.dataset_loader.teardown()
+        self.finalize()
 
     def inference(self):
         dataset_type = []
@@ -161,3 +165,7 @@ class MMFTrainer(
                 logger.info(f"Starting inference on {dataset} set")
                 report, meter = self.evaluation_loop(dataset, use_tqdm=True)
                 self.on_test_end(report=report, meter=meter)
+
+    def finalize(self):
+        self.dataset_loader.teardown()
+        self.teardown()

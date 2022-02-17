@@ -729,8 +729,7 @@ class BranchCombineLayer(nn.Module):
 
 
 class AttnPool1d(nn.Module):
-    """An attention pooling layer that learns weights using an mlp
-    """
+    """An attention pooling layer that learns weights using an mlp"""
 
     def __init__(self, num_features: int, num_attn: int = 1, dropout: float = 0.1):
         super().__init__()
@@ -740,7 +739,7 @@ class AttnPool1d(nn.Module):
             nn.Dropout(p=dropout),
             nn.Linear(num_features // 2, num_attn),
         )
-        self.p_attn = None
+        self.p_attn = torch.tensor(float("nan"))
         self.num_attn = num_attn
 
     def forward(
@@ -752,15 +751,16 @@ class AttnPool1d(nn.Module):
         b = query.size(0)
         score = self.linear(query).transpose(-2, -1)
         if mask is not None:
-            score.data.masked_fill_(mask.unsqueeze(1), -1e9)
-        self.p_attn = nn.functional.softmax(score, dim=-1)
+            score.data.masked_fill_(mask.unsqueeze(1), -10000.0)
+        p_attn = nn.functional.softmax(score, dim=-1)
+        if self.training:
+            self.p_attn = p_attn
 
-        return torch.matmul(self.p_attn, value).view(b, self.num_attn, -1)
+        return torch.matmul(p_attn, value).view(b, self.num_attn, -1)
 
 
 class AttnPool2d(nn.Module):
-    """An attention pooling layer in 2D with multiheaded attention
-    """
+    """An attention pooling layer in 2D with multiheaded attention"""
 
     def __init__(
         self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None
